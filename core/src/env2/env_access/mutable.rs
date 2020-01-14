@@ -135,7 +135,7 @@ where
     where
         Event: Topics<T> + scale::Encode,
     {
-        T::emit_event(&mut self.buffer, event)
+        env_with(|instance| instance.emit_event::<T, _>(event))
     }
 }
 

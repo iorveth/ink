@@ -69,26 +69,6 @@ pub struct EnvInstance {
     has_returned_value: bool,
 }
 
-/// Allow emitting generic events.
-pub trait EmitEvent {
-    /// Emits an event with the given event data.
-    fn emit_event<T, Event>(&mut self, event: Event)
-    where
-        T: Env,
-        Event: Topics<T> + scale::Encode;
-}
-
-impl EmitEvent for EnvInstance {
-    /// Emits an event with the given event data.
-    fn emit_event<T, Event>(&mut self, event: Event)
-    where
-        T: Env,
-        Event: Topics<T> + scale::Encode,
-    {
-        <T as Env>::emit_event(&mut self.buffer, event)
-    }
-}
-
 macro_rules! impl_get_property_for {
     (
         $( #[$meta:meta] )*
@@ -142,6 +122,15 @@ impl EnvInstance {
         fn block_number<BlockNumber>() -> T::BlockNumber;
         /// Returns the minimum balance of the executed contract.
         fn minimum_balance<MinimumBalance>() -> T::Balance;
+    }
+
+    /// Emits an event with the given event data.
+    pub fn emit_event<T, Event>(&mut self, event: Event)
+    where
+        T: Env,
+        Event: Topics<T> + scale::Encode,
+    {
+        <T as Env>::emit_event(&mut self.buffer, event)
     }
 
     /// Sets the rent allowance of the executed contract to the new value.
