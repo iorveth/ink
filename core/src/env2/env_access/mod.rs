@@ -14,12 +14,17 @@
 
 mod immutable;
 mod mutable;
+mod shared_mut;
 
 pub use self::{
     immutable::EnvAccess,
     mutable::{
         EmitEvent,
         EnvAccessMut,
+    },
+    shared_mut::{
+        env_with,
+        EnvInstance,
     },
 };
 

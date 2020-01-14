@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use core::marker::PhantomData;
-
 use crate::{
     env2::{
         call::{
@@ -22,32 +20,41 @@ use crate::{
             CreateParams,
             ReturnType,
         },
-        env_access::env_with,
+        property,
         Env,
-        EnvTypes,
+        GetProperty,
         Result,
+        SetProperty,
         Topics,
     },
-    storage::{
-        alloc::{
-            Allocate,
-            AllocateUsing,
-            Initialize,
-        },
-        Flush,
-        Key,
-    },
+    storage::Key,
 };
 use ink_prelude::vec::Vec;
 
-#[cfg_attr(feature = "ink-generate-abi", derive(type_metadata::Metadata))]
-#[derive(Debug)]
-/// A wrapper around environments to make accessing them more efficient.
-pub struct EnvAccessMut<E> {
-    /// The wrapped environment to access.
-    env: PhantomData<E>,
+/// The single environmental instance.
+static mut ENV_INSTANCE: EnvInstance = EnvInstance {
+    buffer: Vec::new(),
+    has_interacted: false,
+    has_returned_value: false,
+};
+
+/// Executes the given closure on the environmental instance.
+///
+/// This is only safe in a Wasm environment that has no threading support.
+pub fn env_with<F, R>(f: F) -> R
+where
+    F: FnOnce(&mut EnvInstance) -> R,
+{
+    unsafe { f(&mut ENV_INSTANCE) }
+}
+
+/// The actual environmental instance.
+///
+/// Has a buffer and some state variables in order to prevent superflous
+/// allocation and prevent malicious operations.
+pub struct EnvInstance {
     /// A buffer to make environment accesses
-    ///  more efficient by avoiding allocations.
+    /// more efficient by avoiding allocations.
     buffer: Vec<u8>,
     /// False as long as there has been no interaction between
     /// the executed contract and the environment.
@@ -62,52 +69,24 @@ pub struct EnvAccessMut<E> {
     has_returned_value: bool,
 }
 
-impl<E> AllocateUsing for EnvAccessMut<E> {
-    #[inline]
-    unsafe fn allocate_using<A>(_alloc: &mut A) -> Self
+/// Allow emitting generic events.
+pub trait EmitEvent {
+    /// Emits an event with the given event data.
+    fn emit_event<T, Event>(&mut self, event: Event)
     where
-        A: Allocate,
+        T: Env,
+        Event: Topics<T> + scale::Encode;
+}
+
+impl EmitEvent for EnvInstance {
+    /// Emits an event with the given event data.
+    fn emit_event<T, Event>(&mut self, event: Event)
+    where
+        T: Env,
+        Event: Topics<T> + scale::Encode,
     {
-        Self::default()
+        <T as Env>::emit_event(&mut self.buffer, event)
     }
-}
-
-impl<E> Flush for EnvAccessMut<E> {}
-
-impl<E> Initialize for EnvAccessMut<E> {
-    type Args = ();
-
-    #[inline(always)]
-    fn initialize(&mut self, _args: Self::Args) {}
-}
-
-impl<E> Default for EnvAccessMut<E> {
-    fn default() -> Self {
-        Self {
-            env: Default::default(),
-            buffer: Default::default(),
-            has_interacted: false,
-            has_returned_value: false,
-        }
-    }
-}
-
-impl<T> EnvTypes for EnvAccessMut<T>
-where
-    T: EnvTypes,
-{
-    /// The type of an address.
-    type AccountId = T::AccountId;
-    /// The type of balances.
-    type Balance = T::Balance;
-    /// The type of hash.
-    type Hash = T::Hash;
-    /// The type of timestamps.
-    type Moment = T::Moment;
-    /// The type of block number.
-    type BlockNumber = T::BlockNumber;
-    /// The type of a call into the runtime
-    type Call = T::Call;
 }
 
 macro_rules! impl_get_property_for {
@@ -116,10 +95,13 @@ macro_rules! impl_get_property_for {
         fn $fn_name:ident< $prop_name:ident >() -> $ret:ty; $($tt:tt)*
     ) => {
         $( #[$meta] )*
-        pub fn $fn_name(&mut self) -> $ret {
-            env_with(|instance| {
-                instance.$fn_name::<T>()
-            })
+        pub fn $fn_name<T>(&mut self) -> $ret
+        where
+            T: Env,
+        {
+            self.assert_not_yet_returned();
+            self.set_has_interacted();
+            <T as GetProperty<property::$prop_name<T>>>::get_property(&mut self.buffer)
         }
 
         impl_get_property_for!($($tt)*);
@@ -127,39 +109,18 @@ macro_rules! impl_get_property_for {
     () => {}
 }
 
-/// Allow emitting generic events.
-///
-/// # Note
-///
-/// This trait is required in order to fix some name resolution orderings
-/// in the ink! macro generated code.
-pub trait EmitEvent<T>
-where
-    T: Env,
-{
-    /// Emits an event with the given event data.
-    fn emit_event<Event>(&mut self, event: Event)
-    where
-        Event: Topics<T> + scale::Encode;
-}
-
-impl<T> EmitEvent<T> for EnvAccessMut<T>
-where
-    T: Env,
-{
-    /// Emits an event with the given event data.
-    fn emit_event<Event>(&mut self, event: Event)
-    where
-        Event: Topics<T> + scale::Encode,
-    {
-        T::emit_event(&mut self.buffer, event)
+impl EnvInstance {
+    /// Asserts that no value has been returned yet by the contract execution.
+    fn assert_not_yet_returned(&self) {
+        assert!(!self.has_returned_value)
     }
-}
 
-impl<T> EnvAccessMut<T>
-where
-    T: Env,
-{
+    /// Sets the flag for recording interaction between executed contract
+    /// and environment to `true`.
+    fn set_has_interacted(&mut self) {
+        self.has_interacted = true;
+    }
+
     impl_get_property_for! {
         /// Returns the address of the caller of the executed contract.
         fn caller<Caller>() -> T::AccountId;
@@ -184,16 +145,25 @@ where
     }
 
     /// Sets the rent allowance of the executed contract to the new value.
-    pub fn set_rent_allowance(&mut self, new_value: T::Balance) {
-        env_with(|instance| instance.set_rent_allowance::<T>(new_value))
+    pub fn set_rent_allowance<T>(&mut self, new_value: T::Balance)
+    where
+        T: Env,
+    {
+        self.assert_not_yet_returned();
+        self.set_has_interacted();
+        <T as SetProperty<property::RentAllowance<T>>>::set_property(
+            &mut self.buffer,
+            &new_value,
+        )
     }
 
     /// Writes the value to the contract storage under the given key.
-    pub fn set_contract_storage<V>(&mut self, key: Key, value: &V)
+    pub fn set_contract_storage<T, V>(&mut self, key: Key, value: &V)
     where
+        T: Env,
         V: scale::Encode,
     {
-        env_with(|instance| instance.set_contract_storage::<T, _>(key, value))
+        <T as Env>::set_contract_storage(&mut self.buffer, key, value)
     }
 
     /// Returns the value stored under the given key in the contract's storage.
@@ -202,16 +172,20 @@ where
     ///
     /// - If the key's entry is empty
     /// - If the decoding of the typed value failed
-    pub fn get_contract_storage<R>(&mut self, key: Key) -> Result<R>
+    pub fn get_contract_storage<T, R>(&mut self, key: Key) -> Result<R>
     where
+        T: Env,
         R: scale::Decode,
     {
-        env_with(|instance| instance.get_contract_storage::<T, R>(key))
+        <T as Env>::get_contract_storage(&mut self.buffer, key)
     }
 
     /// Clears the contract's storage key entry.
-    pub fn clear_contract_storage(&mut self, key: Key) {
-        env_with(|instance| instance.clear_contract_storage::<T>(key))
+    pub fn clear_contract_storage<T>(&mut self, key: Key)
+    where
+        T: Env,
+    {
+        <T as Env>::clear_contract_storage(key)
     }
 
     /// Invokes a contract message.
@@ -219,8 +193,11 @@ where
     /// # Errors
     ///
     /// If the called contract has trapped.
-    pub fn invoke_contract(&mut self, call_data: &CallParams<T, ()>) -> Result<()> {
-        env_with(|instance| instance.invoke_contract::<T>(call_data))
+    pub fn invoke_contract<T>(&mut self, call_data: &CallParams<T, ()>) -> Result<()>
+    where
+        T: Env,
+    {
+        <T as Env>::invoke_contract(&mut self.buffer, call_data)
     }
 
     /// Evaluates a contract message and returns its result.
@@ -232,14 +209,15 @@ where
     /// - If given too few endowment.
     /// - If arguments passed to the called contract are invalid.
     /// - If the called contract runs out of gas.
-    pub fn eval_contract<R>(
+    pub fn eval_contract<T, R>(
         &mut self,
         call_data: &CallParams<T, ReturnType<R>>,
     ) -> Result<R>
     where
+        T: Env,
         R: scale::Decode,
     {
-        env_with(|instance| instance.eval_contract::<T, R>(call_data))
+        <T as Env>::eval_contract(&mut self.buffer, call_data)
     }
 
     /// Instantiates another contract.
@@ -250,11 +228,14 @@ where
     /// - If the code hash is invalid.
     /// - If given too few endowment.
     /// - If the instantiation process runs out of gas.
-    pub fn create_contract<C>(
+    pub fn create_contract<T, C>(
         &mut self,
         params: &CreateParams<T, C>,
-    ) -> Result<T::AccountId> {
-        env_with(|instance| instance.create_contract::<T, C>(params))
+    ) -> Result<T::AccountId>
+    where
+        T: Env,
+    {
+        <T as Env>::create_contract(&mut self.buffer, params)
     }
 
     /// Returns the input to the executed contract.
@@ -266,8 +247,14 @@ where
     /// - This property must be received as the first action an executed
     ///   contract to its environment and can only be queried once.
     ///   The environment access asserts this guarantee.
-    pub fn input(&mut self) -> CallData {
-        env_with(|instance| instance.input::<T>())
+    pub fn input<T>(&mut self) -> CallData
+    where
+        T: Env,
+    {
+        assert!(!self.has_interacted);
+        self.assert_not_yet_returned();
+        self.set_has_interacted();
+        <T as GetProperty<property::Input<T>>>::get_property(&mut self.buffer)
     }
 
     /// Returns the value back to the caller of the executed contract.
@@ -277,11 +264,15 @@ where
     /// The setting of this property must be the last interaction between
     /// the executed contract and its environment.
     /// The environment access asserts this guarantee.
-    pub fn output<R>(&mut self, return_value: &R)
+    pub fn output<T, R>(&mut self, return_value: &R)
     where
+        T: Env,
         R: scale::Encode,
     {
-        env_with(|instance| instance.output::<T, _>(return_value))
+        self.assert_not_yet_returned();
+        self.set_has_interacted();
+        self.has_returned_value = true;
+        <T as Env>::output(&mut self.buffer, &return_value);
     }
 
     /// Returns a random hash.
@@ -289,13 +280,21 @@ where
     /// # Note
     ///
     /// The subject buffer can be used to further randomize the hash.
-    pub fn random(&mut self, subject: &[u8]) -> T::Hash {
-        env_with(|instance| instance.random::<T>(subject))
+    pub fn random<T>(&mut self, subject: &[u8]) -> T::Hash
+    where
+        T: Env,
+    {
+        self.assert_not_yet_returned();
+        self.set_has_interacted();
+        <T as Env>::random(&mut self.buffer, subject)
     }
 
     /// Prints the given contents to the environmental log.
-    pub fn println(&mut self, content: &str) {
-        env_with(|instance| instance.println::<T>(content))
+    pub fn println<T>(&mut self, content: &str)
+    where
+        T: Env,
+    {
+        <T as Env>::println(content)
     }
 
     /// Returns the value from the *runtime* storage at the position of the key.
@@ -304,10 +303,11 @@ where
     ///
     /// - If the key's entry is empty
     /// - If the decoding of the typed value failed
-    pub fn get_runtime_storage<R>(&mut self, key: &[u8]) -> Result<R>
+    pub fn get_runtime_storage<T, R>(&mut self, key: &[u8]) -> Result<R>
     where
+        T: Env,
         R: scale::Decode,
     {
-        env_with(|instance| instance.get_runtime_storage::<T, R>(key))
+        T::get_runtime_storage(&mut self.buffer, key)
     }
 }
