@@ -46,20 +46,6 @@ use ink_prelude::vec::Vec;
 pub struct EnvAccessMut<E> {
     /// The wrapped environment to access.
     env: PhantomData<E>,
-    /// A buffer to make environment accesses
-    ///  more efficient by avoiding allocations.
-    buffer: Vec<u8>,
-    /// False as long as there has been no interaction between
-    /// the executed contract and the environment.
-    ///
-    /// This flag is used to check at runtime if the environment
-    /// is used correctly in respect to accessing its input.
-    has_interacted: bool,
-    /// True as long as the return value has not yet been set.
-    ///
-    /// This flag is used to check at runtime if the environment
-    /// is used correctly in respect to returning its value.
-    has_returned_value: bool,
 }
 
 impl<E> AllocateUsing for EnvAccessMut<E> {
@@ -85,9 +71,6 @@ impl<E> Default for EnvAccessMut<E> {
     fn default() -> Self {
         Self {
             env: Default::default(),
-            buffer: Default::default(),
-            has_interacted: false,
-            has_returned_value: false,
         }
     }
 }
