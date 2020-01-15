@@ -42,6 +42,7 @@
 //! - For `&mut self` messages prefer using `EnvAccessMut` or `DynEnvAccessMut`.
 //! - Direct access to `SrmlEnv` or `TestEnv` is always the least optimal solution and generally not preferred.
 
+pub mod api;
 mod buffer_arena;
 pub mod call;
 mod dyn_env;
