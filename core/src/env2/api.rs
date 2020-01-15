@@ -1,4 +1,4 @@
-//! Provides the public raw interface towards the host Wasm engine.
+//! The public raw interface towards the host Wasm engine.
 //!
 //! # Note
 //!
